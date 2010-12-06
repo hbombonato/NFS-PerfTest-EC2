@@ -1,0 +1,22 @@
+version: 1
+formatters:
+  brief:
+    format: '%(message)s'
+  precise:
+    format: '%(asctime)s %(levelname)-8s %(name)-15s %(message)s'
+handlers:
+  console:
+    class : logging.StreamHandler
+    formatter: brief
+    level   : INFO
+    stream  : ext://sys.stdout
+  file:
+    class : logging.handlers.RotatingFileHandler
+    formatter: precise
+    level   : DEBUG
+    filename: log.txt
+    maxBytes: 1048576
+    backupCount: 3
+root:
+  level: DEBUG
+  handlers: [console, file]
