@@ -1,0 +1,6 @@
+log.*
+passwords.txt
+
+*.swo
+*.swp
+
