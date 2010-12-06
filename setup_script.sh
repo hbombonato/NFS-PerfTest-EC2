@@ -16,7 +16,13 @@ apt-get -y install $PACKAGES
 iperf -s &
 
 # Create and mount ramdisk
-mkdir /tmp/ramdisk; chmod 777 /tmp/ramdisk
+mkdir /tmp/ramdisk
+
+# Help prevent files from accidentally getting created in the bare folder
+# (which goes to EBS and costs money) rather than in the mounted ramdisk
+chmod 000 /tmp/ramdisk
+
+# This should have 777 permissions
 mount -t tmpfs -o size=384M tmpfs /tmp/ramdisk/
 
 # Create mount points for remote ramdisks

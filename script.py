@@ -3,7 +3,7 @@
 # By Brandon Thomson
 
 # Requires Python 2.7 or newer
-# Mostly designed to be used at the interactive iPython prompt
+# Designed to support use at the interactive iPython prompt: use %run script
 #
 from __future__ import print_function
 
@@ -12,6 +12,14 @@ import time
 import subprocess
 import logging, logging.config
 import yaml
+import random
+import string
+
+def sizeof_fmt(num):
+  for x in ['b','KB','MB','GB','TB']:
+    if num < 1024.0:
+      return "%3.1f%s" % (num, x)
+    num /= 1024.0
 
 with open('log_config.yaml') as f:
   config_dict = yaml.load(f.read())
@@ -83,9 +91,19 @@ def wait_all_active(instances):
     time.sleep(CHECK_DELAY)
 
 ssh_args = [
-  'ssh', '-i', '/home/bthomson/.ssh/mypair.pem', '-q',
+  'ssh',
+
+  # Specify AWS keypair
+  '-i', '/home/bthomson/.ssh/mypair.pem',
+
+  # No useless output
+  '-q',
+
   # Bypass MITM protection:
   '-o', 'UserKnownHostsFile=/dev/null', '-o', 'StrictHostKeyChecking=no',
+
+  # Enable compression to save on bandwidth charges
+  '-C',
 ]
 
 def start_n_micro(n):
@@ -99,12 +117,15 @@ def start_n_micro(n):
     max_count=n,
     image_id=UBUNTU_IMAGE,
     # It looks like all instances reserved at the same time will be in one
-    # availability zone, but it doesn't hurt to sync them anyway
+    # availability zone, but it doesn't hurt to sync them up anyway
     placement="us-east-1b",
     user_data=setup_script
   )
   wait_all_active(resv.instances)
   return instances
+
+def random_fn():
+  return ''.join(random.choice(string.letters + string.digits) for _ in range(10))
 
 def get_ssh_cmd_line(n):
   host_str = 'ubuntu@' + instances[n].public_dns_name
@@ -113,17 +134,32 @@ def get_ssh_cmd_line(n):
 def ssh_cmd(instance, args, block=False):
   host_str = 'ubuntu@' + instance.public_dns_name
   f_args = ssh_args + [host_str] + args
-  logging.debug(" ".join(f_args))
+  logging.debug("Raw cmd: " + " ".join(f_args))
+  p = subprocess.Popen(f_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
   if block:
-    subprocess.check_call(f_args)
+    stdout, stderr = p.communicate()
+    logging.debug("Raw output:\n" + stdout + stderr)
+    if p.returncode:
+      raise subprocess.CalledProcessError(p.returncode)
   else:
-    return subprocess.Popen(f_args, stdout=subprocess.PIPE)
+    return p
+
+defaults = {
+  # All nfs mounts will use these options by default. Changing this is an easy
+  # way to change global mount options
+  'nfs_opts': "rw,proto=tcp,soft,sync,vers=3",
+}
 
 def mount_nfs_share(client, server):
-  logging.debug("mounting nfs share on client")
-  ssh_cmd(client, ['sudo', 'mount',
-                   server.private_ip_address + ":/tmp/ramdisk",
-                   "/mnt/remote_ramdisk_1"], block=True)
+  logging.info("mounting nfs share with options {0}".format(defaults['nfs_opts']))
+  try:
+    ssh_cmd(client, ['sudo', 'mount', '-o', defaults['nfs_opts'],
+                     server.private_ip_address + ":/tmp/ramdisk",
+                     "/mnt/remote_ramdisk_1"], block=True)
+  except subprocess.CalledProcessError as e:
+    if e.returncode == 32: # already mounted
+      return
+    raise
 
 def unmount_nfs_share(client, server):
   logging.debug("unmounting nfs share on client")
@@ -139,21 +175,61 @@ def mount_ramdisk(machine):
   mount_cmd = "sudo mount -t tmpfs -o size=384M tmpfs /tmp/ramdisk"
   ssh_cmd(machine, mount_cmd.split(" "), block=True)
 
-def nfs(client_id, server_id):
-  client, server = id_to_inst(client_id, server_id)
-  logging.debug("nfs transfer from {0} -> {1}".format(client_id, server_id))
+def restart_nfs_service(machine):
+  """Technically this should not be necessary, but it seems like there are
+  some bugs in the latest NFS server on ubuntu"""
+  logging.debug("restarting nfs kernel service")
+  mount_cmd = "sudo service nfs-kernel-server restart"
+  ssh_cmd(machine, mount_cmd.split(" "), block=True)
 
+def nfs_single(client_id, server_id, n_bytes):
+  client, server = id_to_inst(client_id, server_id)
+  logging.info("nfs {0} file transfer from {1} -> {2}".format(
+    sizeof_fmt(n_bytes), client_id, server_id)
+  )
+
+  restart_nfs_service(server)
   mount_nfs_share(client, server)
 
   try:
     logging.debug("Transferring file")
-    dd_cmd = "dd if=/dev/random of=/mnt/remote_ramdisk_1/test bs=1M count=1"
+    dd_cmd = ("dd if=/dev/urandom of=/mnt/remote_ramdisk_1/{0} "
+              "bs={1} count=1".format(random_fn(), n_bytes))
     ssh_cmd(client, dd_cmd.split(" "), block=True)
   finally:
     unmount_nfs_share(client, server)
+    unmount_ramdisk(server)
+    mount_ramdisk(server)
 
-  unmount_ramdisk(server)
-  mount_ramdisk(server)
+def nfs_multi(client_id, server_id, count, n_bytes):
+  client, server = id_to_inst(client_id, server_id)
+  log_str = ("nfs multi transfer: create {0} {1} files on {2} (server) from "
+             "{3} (client)")
+  logging.info(log_str.format(count, sizeof_fmt(n_bytes), server_id, client_id))
+
+  restart_nfs_service(server)
+  mount_nfs_share(client, server)
+
+  try:
+    logging.debug("Transferring file")
+    script = ('"for i in {1..%d}; do dd if=/dev/urandom '
+              'of=/mnt/remote_ramdisk_1/file_$i bs=%d count=1; done"' %
+              (count, n_bytes))
+    args = ['/usr/bin/time', '-f', "%e", 'bash', '-c', script]
+    p = ssh_cmd(client, args, block=False)
+    stdout, stderr = p.communicate()
+  finally:
+    unmount_nfs_share(client, server)
+    unmount_ramdisk(server)
+    mount_ramdisk(server)
+
+  return float(stderr.split("\n")[-2])
+
+def all_tests():
+  logging.info("Executing all tests")
+  iperf_all()
+  nfs_single(0,1,1024)
+  nfs_multi(0,1,1024,1024)
 
 def id_to_inst(*args):
   """Turns id numbers into instances"""
