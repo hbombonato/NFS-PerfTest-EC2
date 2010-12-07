@@ -9,8 +9,9 @@ Getting Started
 After you`ve downloaded the code, you`ll need to make a file called
 "passwords.txt" containing a valid AWS Access Key ID on the first line, and
 the associated Secret Access Key on the second line. Do not put anything else
-in this file. These can be created through the Amazon AWS Control Panel. For
-your safety, you may wish to `chmod 600` this file.
+in this file. (If you do not know where to find these, they can be created
+through the Amazon AWS Control Panel under Security Credentials.) For your
+safety, you may wish to `chmod 600` this file.
 
 You will also need to create a keypair in the EC2 control panel called
 "mypair" and place it in the "~/.ssh/" folder to communicate over ssh with the
