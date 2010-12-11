@@ -12,8 +12,9 @@ apt-get -y update
 apt-get -y install $PACKAGES
 # No upgrades needed; we're not really worred about security
 
-# Start iperf server
+# Start iperf servers (TCP and UDP ports)
 iperf -s &
+iperf -su &
 
 # Create and mount ramdisk
 mkdir /tmp/ramdisk

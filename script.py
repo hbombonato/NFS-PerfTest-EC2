@@ -14,6 +14,8 @@ import logging, logging.config
 import yaml
 import random
 import string
+import csv
+import datetime
 
 def sizeof_fmt(num):
   for x in ['b','KB','MB','GB','TB']:
@@ -31,10 +33,8 @@ logging.config.dictConfig(config_dict)
 # 099720109477/ebs/ubuntu-images/ubuntu-lucid-10.04-amd64-server-20101020
 UBUNTU_IMAGE = "ami-4a0df923"
 
-# No upgrade here; we don't care about security
-#
 # Start the same services on every server, performance is not really likely to
-# be affected
+# be affected, it's just a few services
 with open('setup_script.sh') as f:
   setup_script = f.read()
 
@@ -58,6 +58,8 @@ def get_active_instances():
 
   return instances
 
+# "instances" tracks ALL instances we are currently paying for... use this to
+# do iperf between all pairs of machines, etc.
 instances = get_active_instances()
 
 # Add an idx parameter to all instances (used as a simple integer id)
@@ -231,26 +233,63 @@ def all_tests():
   nfs_single(0,1,1024)
   nfs_multi(0,1,1024,1024)
 
+def get_date_time():
+  return str(datetime.datetime.now()).split(" ")
+
+def get_csv_writer(f):
+  return csv.writer(f, delimiter=' ', quotechar='|', quoting=csv.QUOTE_MINIMAL)
+
 def id_to_inst(*args):
   """Turns id numbers into instances"""
   if type(args[0]) == type(0):
     return (instances[x] for x in args)
   return args
 
-def iperf_2(id1, id2):
-  i1, i2 = id_to_inst(id1, id2)
-  logging.info("Iperf from {0} -> {1}".format(id1, id2))
-  p1 = ssh_cmd(i1, ['iperf', '-c', i2.private_ip_address])
+def iperf_2(client_id, server_id):
+  client, server = id_to_inst(client_id, server_id)
+  logging.info("Iperf from {0} -> {1}".format(client_id, server_id))
 
-  stdout, _ = p1.communicate();
-  logging.debug("Raw output from iperf:\n" + stdout)
-  return stdout.split('\n')[6].split("    ")
+  p1 = ssh_cmd(client, ['iperf', '-c', server.private_ip_address, '--reportstyle=C'])
+  stdout, stderr = p1.communicate();
+  if stderr:
+    logging.error("Raw stderr from iperf TCP:\n" + stderr)
+    raise Exception()
+
+  logging.debug("Raw output from iperf TCP:\n" + stdout)
+  s = stdout.strip().split(',')
+  tcp_interval, tcp_size, tcp_speed = s[6], s[7], s[8]
+
+  p1 = ssh_cmd(client, ['iperf', '-c', server.private_ip_address, '-u', '-b', '10m',
+                        '--reportstyle=C'])
+  stdout, stderr = p1.communicate();
+  if stderr:
+    logging.error("Raw stderr from iperf UDP:\n" + stderr)
+    raise Exception()
+
+  logging.debug("Raw output from iperf UDP:\n" + stdout)
+  lines = stdout.split('\n')
+  o = lines[0].replace('\n','').split(',')
+  t = lines[1].replace('\n','').split(',')
+
+  udp_interval, udp_size, udp_speed = o[6], o[7], o[8]
+  datagrams_sent, jitter, num_lost = t[11], t[9], t[10]
+  num_out_of_order = t[13]
+
+  date, time = get_date_time()
+
+  with open('iperf.csv', 'ab') as f:
+    csv_writer = get_csv_writer(f)
+    csv_writer.writerow(
+      [date, time, client_id, server_id, client.id, server.id, tcp_interval, tcp_size, tcp_speed,
+       udp_interval, udp_size, udp_speed, jitter, num_lost, datagrams_sent,
+       num_out_of_order]
+    )
 
 def iperf_all_sequential():
   for i1 in instances:
     for i2 in instances:
       if i1 != i2:
-        interval, size, speed = iperf_2(i1, i2)
+        iperf_2(i1, i2)
 
 def term_all():
   for i in instances:
