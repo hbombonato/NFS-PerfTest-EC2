@@ -1,0 +1,2 @@
+date time client_id server_id client_uqid server_uqid n_bytes count duration nfs_version nfs_rsize nfs_wsize nfs_proto
+2010-12-12 01:21:03.024768 0 1 i-226a5d4f i-3c6a5d51 1024 10 0.03 v3 32768 32768 tcp
