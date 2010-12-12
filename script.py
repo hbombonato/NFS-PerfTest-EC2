@@ -133,6 +133,8 @@ def get_ssh_cmd_line(n):
   host_str = 'ubuntu@' + instances[n].public_dns_name
   return " ".join(ssh_args + [host_str])
 
+class ProcException(Exception): pass
+
 def ssh_cmd(instance, args, block=False):
   host_str = 'ubuntu@' + instance.public_dns_name
   f_args = ssh_args + [host_str] + args
@@ -142,24 +144,59 @@ def ssh_cmd(instance, args, block=False):
     stdout, stderr = p.communicate()
     logging.debug("Raw output:\n" + stdout + stderr)
     if p.returncode:
-      raise subprocess.CalledProcessError(p.returncode)
+      raise ProcException(p.returncode)
+    return stdout, stderr
   else:
     return p
 
-defaults = {
-  # All nfs mounts will use these options by default. Changing this is an easy
-  # way to change global mount options
-  'nfs_opts': "rw,proto=tcp,soft,sync,vers=3",
+# This is a global so we don't have to pass it around everywhere... it would
+# make running tests from the console more annoying if we passed it around too
+#
+# the vary_nfs_opts() function modifies these values as appropriate
+nfs_opts = {
+  'opt_str': 'rw,proto=tcp,soft,sync,vers=3,rsize=32768,wsize=32768',
+  'version': 'v3',
+  'rsize': '32768',
+  'wsize': '32768',
+  'proto': 'tcp',
 }
 
+def vary_nfs_opts(f, *args):
+  #for rsize in [2**x for x in range(5,20)]
+  for proto in ('tcp', 'udp'):
+    for version in ('v3', 'v4'):
+      for wsize in (2**(2*x+1) for x in range(4,10)):
+        fmt_s = 'rw,proto={0},soft,sync{1},rsize=32768,wsize={2}'
+        vers = ',vers=3' if version == 'v3' else ''
+        nfs_opts['opt_str'] = fmt_s.format(proto, vers, wsize)
+
+        nfs_opts['version'] = version
+        nfs_opts['rsize'] = '32768'
+        nfs_opts['wsize'] = wsize
+        nfs_opts['proto'] = proto
+        f(*args)
+
+def vary_nfs_single():
+  pass
+
 def mount_nfs_share(client, server):
-  logging.info("mounting nfs share with options {0}".format(defaults['nfs_opts']))
+  logging.info("mounting nfs share with options {0}".format(nfs_opts['opt_str']))
+
+  opts = ['sudo', 'mount']
+  if nfs_opts['version'] == 'v4':
+    opts += ['-t', 'nfs4']
+    mnt_path = ":/"
+  else:
+    mnt_path = ":/tmp/ramdisk"
+
+  opts += ['-o', nfs_opts['opt_str'], server.private_ip_address +
+           mnt_path, "/mnt/remote_ramdisk_1"]
+
   try:
-    ssh_cmd(client, ['sudo', 'mount', '-o', defaults['nfs_opts'],
-                     server.private_ip_address + ":/tmp/ramdisk",
-                     "/mnt/remote_ramdisk_1"], block=True)
-  except subprocess.CalledProcessError as e:
-    if e.returncode == 32: # already mounted
+    ssh_cmd(client, opts, block=True)
+  except ProcException as e:
+    # This seems to be wrong
+    if e.args[0] == 32: # already mounted
       return
     raise
 
@@ -190,18 +227,31 @@ def nfs_single(client_id, server_id, n_bytes):
     sizeof_fmt(n_bytes), client_id, server_id)
   )
 
-  restart_nfs_service(server)
+  #restart_nfs_service(server)
   mount_nfs_share(client, server)
 
   try:
     logging.debug("Transferring file")
     dd_cmd = ("dd if=/dev/urandom of=/mnt/remote_ramdisk_1/{0} "
               "bs={1} count=1".format(random_fn(), n_bytes))
-    ssh_cmd(client, dd_cmd.split(" "), block=True)
+    _, stderr = ssh_cmd(client, dd_cmd.split(" "), block=True)
   finally:
     unmount_nfs_share(client, server)
     unmount_ramdisk(server)
     mount_ramdisk(server)
+
+  _, duration, speed = stderr.split("\n")[2].strip().split(", ")
+  speed = speed.replace(' ', '')
+  duration = duration.split(" ")[0]
+  date, time = get_date_time()
+
+  with open('nfs_single.csv', 'ab') as f:
+    csv_writer = get_csv_writer(f)
+    csv_writer.writerow(
+      [date, time, client_id, server_id, client.id, server.id, n_bytes,
+       duration, speed, nfs_opts['version'], nfs_opts['rsize'],
+       nfs_opts['wsize'], nfs_opts['proto']]
+    )
 
 def nfs_multi(client_id, server_id, count, n_bytes):
   client, server = id_to_inst(client_id, server_id)
@@ -225,7 +275,16 @@ def nfs_multi(client_id, server_id, count, n_bytes):
     unmount_ramdisk(server)
     mount_ramdisk(server)
 
-  return float(stderr.split("\n")[-2])
+  duration = float(stderr.split("\n")[-2])
+  date, time = get_date_time()
+
+  with open('nfs_multi.csv', 'ab') as f:
+    csv_writer = get_csv_writer(f)
+    csv_writer.writerow(
+      [date, time, client_id, server_id, client.id, server.id, n_bytes,
+       count, duration, nfs_opts['version'], nfs_opts['rsize'],
+       nfs_opts['wsize'], nfs_opts['proto']]
+    )
 
 def all_tests():
   logging.info("Executing all tests")
@@ -245,9 +304,45 @@ def id_to_inst(*args):
     return (instances[x] for x in args)
   return args
 
+def log_2_test(test_name, id1, id2):
+  logging.info("{0} from {1} -> {2}".format(test_name, id1, id2))
+
+def tracert(src_id, target_id):
+  log_2_test("tracert", src_id, target_id)
+  src, target = id_to_inst(src_id, target_id)
+
+  stdout, _ = ssh_cmd(src, ['traceroute', target.private_ip_address],
+                      block=True)
+
+  num_hops = len(stdout.split("\n")) - 2
+
+  date, time = get_date_time()
+
+  with open('tracert.csv', 'ab') as f:
+    csv_writer = get_csv_writer(f)
+    csv_writer.writerow(
+      [date, time, src_id, target_id, src.id, target.id, num_hops]
+    )
+
+def ping(src_id, target_id):
+  log_2_test("ping", src_id, target_id)
+  src, target = id_to_inst(src_id, target_id)
+  stdout, _ = ssh_cmd(src, ['ping', '-c', '2', target.private_ip_address],
+                      block=True)
+
+  ping_time = stdout.split("\n")[2].strip().split("=")[3].split(" ")[0]
+
+  date, time = get_date_time()
+
+  with open('ping.csv', 'ab') as f:
+    csv_writer = get_csv_writer(f)
+    csv_writer.writerow(
+      [date, time, src_id, target_id, src.id, target.id, ping_time]
+    )
+
 def iperf_2(client_id, server_id):
   client, server = id_to_inst(client_id, server_id)
-  logging.info("Iperf from {0} -> {1}".format(client_id, server_id))
+  log_2_test("iperf", client_id, server_id)
 
   p1 = ssh_cmd(client, ['iperf', '-c', server.private_ip_address, '--reportstyle=C'])
   stdout, stderr = p1.communicate();
@@ -280,9 +375,9 @@ def iperf_2(client_id, server_id):
   with open('iperf.csv', 'ab') as f:
     csv_writer = get_csv_writer(f)
     csv_writer.writerow(
-      [date, time, client_id, server_id, client.id, server.id, tcp_interval, tcp_size, tcp_speed,
-       udp_interval, udp_size, udp_speed, jitter, num_lost, datagrams_sent,
-       num_out_of_order]
+      [date, time, client_id, server_id, client.id, server.id, tcp_interval,
+       tcp_size, tcp_speed, udp_interval, udp_size, udp_speed, jitter,
+       num_lost, datagrams_sent, num_out_of_order]
     )
 
 def iperf_all_sequential():

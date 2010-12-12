@@ -6,7 +6,7 @@
 #
 # Note: this runs as root, so no need to mess with sudo
 #
-PACKAGES="iperf nfs-kernel-server nfs-common portmap"
+PACKAGES="iperf nfs-kernel-server nfs-common portmap traceroute"
 
 apt-get -y update
 apt-get -y install $PACKAGES
@@ -32,4 +32,8 @@ mkdir /mnt/remote_ramdisk_1
 # Setup NFS server. No security since it is already setup at the AWS layer
 EXPORT_STR="/tmp/ramdisk 10.0.0.0/8(rw,insecure,no_subtree_check,async,fsid=0)"
 echo $EXPORT_STR >> /etc/exports
+
+# NFSv4 will break without this
+echo "NEED_IDMAPD=yes" > /etc/default/nfs-common
+
 service nfs-kernel-server restart
