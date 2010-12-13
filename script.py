@@ -213,12 +213,21 @@ def all_tests():
 
 def vary_nfs_opts(f, *args):
   #for rsize in [2**x for x in range(5,20)]
+
+  #v3 32768 udp
+  #v3 131072 udp
+  #v3 524288 udp
+  #sometimes v4 with 512 is also not working, v3 seems ok
+  # 2048 very slow
+
   for proto in ('tcp', 'udp'):
     for version in ('v3', 'v4'):
+      if version == 'v4' and proto == 'udp':
+        continue
       if proto == 'tcp':
-        wsizes = [2**(2*x+1) for x in range(4,10)]
+        wsizes = [2**(2*x+1) for x in range(4,10)] + [1024*1024]
       else:
-        wsizes = [512, 2048] # 8192 is an error
+        wsizes = [4096, 8192]
       for wsize in wsizes:
         fmt_s = 'rw,proto={0},soft,async{1},rsize=8192,wsize={2}'
         vers = ',vers=3' if version == 'v3' else ''
@@ -230,43 +239,46 @@ def vary_nfs_opts(f, *args):
         nfs_opts['proto'] = proto
         f(*args)
 
-def vary_nfs_multi(client_id, server_id):
-  client, server = id_to_inst(client_id, server_id)
+def vary_nfs_multi(client_id, server_id, n):
+  for i in range(n):
+    client, server = id_to_inst(client_id, server_id)
 
-  try:
-    unmount_nfs_share(client, server)
-    unmount_nfs_share(client, server)
-    unmount_nfs_share(client, server)
-  except ProcException:
-    pass
+    try:
+      unmount_nfs_share(client, server)
+      unmount_nfs_share(client, server)
+      unmount_nfs_share(client, server)
+    except ProcException:
+      pass
 
-  restart_nfs_service(server)
+    restart_nfs_service(server)
 
-  for n_bytes in [1024, 65536, 524288, 1048576]:
-    for count in [10, 50, 250]:
-      vary_nfs_opts(nfs_multi, client_id, server_id, count, n_bytes)
+    for n_bytes in [1024, 65536, 524288, 1024*1024]:
+      for count in [10, 50, 250]:
+        vary_nfs_opts(nfs_multi, client_id, server_id, count, n_bytes)
 
-def vary_nfs_single(client_id, server_id):
-  client, server = id_to_inst(client_id, server_id)
+def vary_nfs_single(client_id, server_id, n):
+  for i in range(n):
+    client, server = id_to_inst(client_id, server_id)
 
-  # Sometimes nfs shares can end up mounted multiple times, for unknown
-  # reasons
-  try:
-    unmount_nfs_share(client, server)
-    unmount_nfs_share(client, server)
-    unmount_nfs_share(client, server)
-  except ProcException:
-    pass
+    # Sometimes nfs shares can end up mounted multiple times, for unknown
+    # reasons
+    try:
+      unmount_nfs_share(client, server)
+      unmount_nfs_share(client, server)
+      unmount_nfs_share(client, server)
+    except ProcException:
+      pass
 
-  try:
-    mount_ramdisk(server)
-  except ProcException:
-    pass
+    try:
+      mount_ramdisk(server)
+    except ProcException:
+      pass
 
-  restart_nfs_service(server)
+    restart_nfs_service(server)
 
-  for n_bytes in [1024, 65536, 524288, 1048576, 10485760, 73400320]:
-    vary_nfs_opts(nfs_single, client_id, server_id, n_bytes)
+    for n_bytes in [1024, 65536, 524288, 1048576, 10485760, 73400320,
+                    512*1024*1024]:
+      vary_nfs_opts(nfs_single, client_id, server_id, n_bytes)
 
 def mount_nfs_share(client, server):
   logging.info("mounting nfs share with options {0}".format(nfs_opts['opt_str']))
@@ -400,8 +412,7 @@ def nfs_multi(client_id, server_id, count, n_bytes):
     _, stderr = ssh_cmd(client, args, block=True)
   finally:
     unmount_nfs_share(client, server)
-    unmount_ramdisk(server)
-    mount_ramdisk(server)
+    delete_ramdisk_files(server)
 
   duration = float(stderr.split("\n")[-2])
   date, time = get_date_time()
@@ -490,13 +501,14 @@ def iperf_2(client_id, server_id):
        num_lost, datagrams_sent, num_out_of_order]
     )
 
-def network_test_all_sequential():
-  """Runs network tests between all pairs of instances"""
-  for i1 in instances:
-    for i2 in instances:
-      if i1 != i2:
-        id1 = i1.idx
-        id2 = i2.idx
-        iperf_2(id1, id2)
-        ping(id1, id2)
-        tracert(id1, id2)
+def network_test_all_sequential(n):
+  """Runs network tests between all pairs of instances n times"""
+  for i in range(n):
+    for i1 in instances:
+      for i2 in instances:
+        if i1 != i2:
+          id1 = i1.idx
+          id2 = i2.idx
+          iperf_2(id1, id2)
+          ping(id1, id2)
+          tracert(id1, id2)
