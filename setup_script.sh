@@ -16,7 +16,7 @@ apt-get -y install $PACKAGES
 iperf -s &
 iperf -su &
 
-# Create and mount ramdisk
+# Create and mount destination ramdisk
 mkdir /tmp/ramdisk
 
 # Help prevent files from accidentally getting created in the bare folder
@@ -24,7 +24,15 @@ mkdir /tmp/ramdisk
 chmod 000 /tmp/ramdisk
 
 # This should have 777 permissions
-mount -t tmpfs -o size=384M tmpfs /tmp/ramdisk/
+mount -t tmpfs -o size=514M tmpfs /tmp/ramdisk/
+
+# Create and mount source ramdisk (never unmount this)
+mkdir /tmp/src_ramdisk
+mount -t tmpfs -o size=514M tmpfs /tmp/src_ramdisk
+
+# Copy random data into source ramdisk... unfortunately this takes forever...
+# 200s or more
+dd if=/dev/urandom of=/tmp/src_ramdisk/data bs=1M count=512
 
 # Create mount points for remote ramdisks
 mkdir /mnt/remote_ramdisk_1

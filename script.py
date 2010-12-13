@@ -91,8 +91,11 @@ def id_to_inst(*args):
 
 #AMAZON_LINUX_EBS = "ami-2272864b" # Required for micro instances
 
-# 099720109477/ebs/ubuntu-images/ubuntu-lucid-10.04-amd64-server-20101020
-UBUNTU_IMAGE = "ami-4a0df923"
+# Note: 64-bit images not supported for small instance type
+
+# http://uec-images.ubuntu.com/releases/lucid/release/
+UBUNTU_IMAGE_64 = "ami-4a0df923"
+UBUNTU_IMAGE_32 = "ami-480df921"
 
 # Start the same services on every server, performance is not really likely to
 # be affected, it's just a few services
@@ -130,7 +133,7 @@ for idx, inst in enumerate(instances):
 def start_one_micro():
   resv = conn.run_instances(instance_type="t1.micro",
                             key_name="mypair",
-                            image_id=UBUNTU_IMAGE)
+                            image_id=UBUNTU_IMAGE_32)
 
   inst = resv.instances[0]
   return inst
@@ -154,15 +157,21 @@ def wait_all_active(instances):
     time.sleep(CHECK_DELAY)
 
 def start_n_micro(n):
+  return start_n_inst(n, "t1.micro", UBUNTU_IMAGE_32)
+
+def start_n_small(n):
+  return start_n_inst(n, "m1.small", UBUNTU_IMAGE_32)
+
+def start_n_inst(n, inst_type, image):
   if not 0 < n < 4: # Safety valve
     logging.error("Warning: {0} is too many instances.".format(n))
     return
   resv = conn.run_instances(
-    instance_type="t1.micro",
+    instance_type=inst_type,
     key_name="mypair",
     min_count=n,
     max_count=n,
-    image_id=UBUNTU_IMAGE,
+    image_id=image,
     # It looks like all instances reserved at the same time will be in one
     # availability zone, but it doesn't hurt to sync them up anyway
     placement="us-east-1b",
@@ -186,9 +195,9 @@ def term_all():
 # the vary_nfs_opts() function modifies these values as appropriate, then
 # they are read by each NFS test function
 nfs_opts = {
-  'opt_str': 'rw,proto=tcp,soft,sync,vers=3,rsize=32768,wsize=32768',
+  'opt_str': 'rw,proto=tcp,soft,async,vers=3',
   'version': 'v3',
-  'rsize': '32768',
+  'rsize': '8192',
   'wsize': '32768',
   'proto': 'tcp',
 }
@@ -211,12 +220,12 @@ def vary_nfs_opts(f, *args):
       else:
         wsizes = [512, 2048] # 8192 is an error
       for wsize in wsizes:
-        fmt_s = 'rw,proto={0},soft,sync{1},rsize=32768,wsize={2}'
+        fmt_s = 'rw,proto={0},soft,async{1},rsize=8192,wsize={2}'
         vers = ',vers=3' if version == 'v3' else ''
         nfs_opts['opt_str'] = fmt_s.format(proto, vers, wsize)
 
         nfs_opts['version'] = version
-        nfs_opts['rsize'] = '32768'
+        nfs_opts['rsize'] = '8192'
         nfs_opts['wsize'] = wsize
         nfs_opts['proto'] = proto
         f(*args)
@@ -240,6 +249,8 @@ def vary_nfs_multi(client_id, server_id):
 def vary_nfs_single(client_id, server_id):
   client, server = id_to_inst(client_id, server_id)
 
+  # Sometimes nfs shares can end up mounted multiple times, for unknown
+  # reasons
   try:
     unmount_nfs_share(client, server)
     unmount_nfs_share(client, server)
@@ -254,7 +265,7 @@ def vary_nfs_single(client_id, server_id):
 
   restart_nfs_service(server)
 
-  for n_bytes in [1024, 65536, 524288, 1048576, 10485760, 78643200, 262144000]:
+  for n_bytes in [1024, 65536, 524288, 1048576, 10485760, 73400320]:
     vary_nfs_opts(nfs_single, client_id, server_id, n_bytes)
 
 def mount_nfs_share(client, server):
@@ -291,9 +302,14 @@ def unmount_ramdisk(machine):
     # Only reason this should fail is if it's already unmounted
     logging.warning("umount failed")
 
+def delete_ramdisk_files(machine):
+  logging.debug("clearing ramdisk")
+  ssh_cmd(machine, ['sudo', 'bash', '-c', '"rm -f /tmp/ramdisk/*"'],
+          block=True)
+
 def mount_ramdisk(machine):
   logging.debug("remounting fresh ramdisk on server")
-  mount_cmd = "sudo mount -t tmpfs -o size=384M tmpfs /tmp/ramdisk"
+  mount_cmd = "sudo mount -t tmpfs -o size=514M tmpfs /tmp/ramdisk"
   ssh_cmd(machine, mount_cmd.split(" "), block=True)
 
 def restart_nfs_service(machine):
@@ -313,19 +329,31 @@ def nfs_multi_client_multi_file(client_ids, server_id, count, n_bytes):
   for client in client_ids:
     nfs_multi(client_id, server_id, count, n_bytes)
 
+def get_dd_size(n_bytes):
+  # dd seems more likely to fail randomly when the block size gets too
+  # big. might actually be a bug in NFS as it seems to require an
+  # nfs-kernel-server restart to fix once it gets messed up.
+  bs = min(1024*128, n_bytes)
+  count = 1 if bs == n_bytes else n_bytes/bs
+  n_bytes = count * bs
+  return n_bytes, bs, count
+
 def nfs_single(client_id, server_id, n_bytes):
   client, server = id_to_inst(client_id, server_id)
-  logging.info("nfs {0} file transfer from {1} -> {2}".format(
-    sizeof_fmt(n_bytes), client_id, server_id)
-  )
 
   #restart_nfs_service(server)
   mount_nfs_share(client, server)
 
+  n_bytes, bs, count = get_dd_size(n_bytes)
+
+  logging.info("nfs {0} ({1} {2} blocks) file transfer from {3} -> {4}".format(
+    sizeof_fmt(n_bytes), count, sizeof_fmt(bs), client_id, server_id)
+  )
+
   try:
     logging.debug("Transferring file")
-    dd_cmd = ("dd if=/dev/urandom of=/mnt/remote_ramdisk_1/{0} "
-              "bs={1} count=1".format(random_fn(), n_bytes))
+    dd_cmd = ("dd if=/tmp/src_ramdisk/data of=/mnt/remote_ramdisk_1/{0} "
+              "bs={1} count={2}".format(random_fn(), bs, count))
     _, stderr = ssh_cmd(client, dd_cmd.split(" "), block=True)
   except ProcException:
     logging.warning("dd failure")
@@ -336,8 +364,7 @@ def nfs_single(client_id, server_id, n_bytes):
     duration = duration.split(" ")[0]
   finally:
     unmount_nfs_share(client, server)
-    unmount_ramdisk(server)
-    mount_ramdisk(server)
+    delete_ramdisk_files(server)
 
   date, time = get_date_time()
 
@@ -351,18 +378,24 @@ def nfs_single(client_id, server_id, n_bytes):
 
 def nfs_multi(client_id, server_id, count, n_bytes):
   client, server = id_to_inst(client_id, server_id)
-  log_str = ("nfs multi transfer: create {0} {1} files on {2} (server) from "
+
+  n_bytes, bs, block_count = get_dd_size(n_bytes)
+
+  log_str = ("nfs multi transfer: create {0} {1} files ({2}x{3}) on {2} (server) from "
              "{3} (client)")
-  logging.info(log_str.format(count, sizeof_fmt(n_bytes), server_id, client_id))
+  logging.info(log_str.format(
+    count, sizeof_fmt(n_bytes), sizeof_fmt(bs), block_count, server_id,
+    client_id
+  ))
 
   #restart_nfs_service(server)
   mount_nfs_share(client, server)
 
   try:
     logging.debug("Transferring file")
-    script = ('"for i in {1..%d}; do dd if=/dev/urandom '
-              'of=/mnt/remote_ramdisk_1/file_$i bs=%d count=1; done"' %
-              (count, n_bytes))
+    script = ('"for i in {1..%d}; do dd if=/tmp/src_ramdisk/data  '
+              'of=/mnt/remote_ramdisk_1/file_$i bs=%d count=%d; done"' %
+              (count, bs, block_count))
     args = ['/usr/bin/time', '-f', "%e", 'bash', '-c', script]
     _, stderr = ssh_cmd(client, args, block=True)
   finally:
@@ -462,6 +495,8 @@ def network_test_all_sequential():
   for i1 in instances:
     for i2 in instances:
       if i1 != i2:
-        iperf_2(i1, i2)
-        ping(i1, i2)
-        tracert(i1, i2)
+        id1 = i1.idx
+        id2 = i2.idx
+        iperf_2(id1, id2)
+        ping(id1, id2)
+        tracert(id1, id2)
