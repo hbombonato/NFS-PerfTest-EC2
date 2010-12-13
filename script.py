@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+# vim: set tw=74:
+#
 # NFS EC2 Test Script
 # By Brandon Thomson
 
@@ -17,6 +19,10 @@ import string
 import csv
 import datetime
 
+##########################################################################
+## Utility functions: utility stuff and logging setup
+##########################################################################
+
 def sizeof_fmt(num):
   for x in ['b','KB','MB','GB','TB']:
     if num < 1024.0:
@@ -27,6 +33,61 @@ with open('log_config.yaml') as f:
   config_dict = yaml.load(f.read())
 
 logging.config.dictConfig(config_dict)
+
+def random_fn():
+  return ''.join(random.choice(string.letters + string.digits) for _ in range(10))
+
+def get_ssh_cmd_line(n):
+  host_str = 'ubuntu@' + instances[n].public_dns_name
+  return " ".join(ssh_args + [host_str])
+
+class ProcException(Exception): pass
+
+ssh_args = [
+  'ssh',
+
+  # Specify AWS keypair
+  '-i', '/home/bthomson/.ssh/mypair.pem',
+
+  # No useless output
+  '-q',
+
+  # Bypass MITM protection:
+  '-o', 'UserKnownHostsFile=/dev/null', '-o', 'StrictHostKeyChecking=no',
+
+  # Enable compression to save on bandwidth charges
+  '-C',
+]
+
+def ssh_cmd(instance, args, block=False):
+  host_str = 'ubuntu@' + instance.public_dns_name
+  f_args = ssh_args + [host_str] + args
+  logging.debug("Raw cmd: " + " ".join(f_args))
+  p = subprocess.Popen(f_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+  if block:
+    stdout, stderr = p.communicate()
+    logging.debug("Raw output:\n" + stdout + stderr)
+    if p.returncode:
+      raise ProcException(p.returncode)
+    return stdout, stderr
+  else:
+    return p
+
+def get_date_time():
+  return str(datetime.datetime.now()).split(" ")
+
+def get_csv_writer(f):
+  return csv.writer(f, delimiter=' ', quotechar='|', quoting=csv.QUOTE_MINIMAL)
+
+def id_to_inst(*args):
+  """Turns id numbers into instances"""
+  if type(args[0]) == type(0):
+    return (instances[x] for x in args)
+  return args
+
+##########################################################################
+## EC2 Setup functions: For assigning and starting machines
+##########################################################################
 
 #AMAZON_LINUX_EBS = "ami-2272864b" # Required for micro instances
 
@@ -92,22 +153,6 @@ def wait_all_active(instances):
     logging.info("Will recheck in {0} seconds.".format(CHECK_DELAY))
     time.sleep(CHECK_DELAY)
 
-ssh_args = [
-  'ssh',
-
-  # Specify AWS keypair
-  '-i', '/home/bthomson/.ssh/mypair.pem',
-
-  # No useless output
-  '-q',
-
-  # Bypass MITM protection:
-  '-o', 'UserKnownHostsFile=/dev/null', '-o', 'StrictHostKeyChecking=no',
-
-  # Enable compression to save on bandwidth charges
-  '-C',
-]
-
 def start_n_micro(n):
   if not 0 < n < 4: # Safety valve
     logging.error("Warning: {0} is too many instances.".format(n))
@@ -126,33 +171,20 @@ def start_n_micro(n):
   wait_all_active(resv.instances)
   return instances
 
-def random_fn():
-  return ''.join(random.choice(string.letters + string.digits) for _ in range(10))
+def term_all():
+  for i in instances:
+    i.terminate()
 
-def get_ssh_cmd_line(n):
-  host_str = 'ubuntu@' + instances[n].public_dns_name
-  return " ".join(ssh_args + [host_str])
+##########################################################################
+## Test functions: Stuff related to running tests
+##########################################################################
 
-class ProcException(Exception): pass
-
-def ssh_cmd(instance, args, block=False):
-  host_str = 'ubuntu@' + instance.public_dns_name
-  f_args = ssh_args + [host_str] + args
-  logging.debug("Raw cmd: " + " ".join(f_args))
-  p = subprocess.Popen(f_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-  if block:
-    stdout, stderr = p.communicate()
-    logging.debug("Raw output:\n" + stdout + stderr)
-    if p.returncode:
-      raise ProcException(p.returncode)
-    return stdout, stderr
-  else:
-    return p
-
-# This is a global so we don't have to pass it around everywhere... it would
-# make running tests from the console more annoying if we passed it around too
+# This is a global so we don't have to pass it around everywhere... it
+# would make running tests from the console more annoying if we passed it
+# around too
 #
-# the vary_nfs_opts() function modifies these values as appropriate
+# the vary_nfs_opts() function modifies these values as appropriate, then
+# they are read by each NFS test function
 nfs_opts = {
   'opt_str': 'rw,proto=tcp,soft,sync,vers=3,rsize=32768,wsize=32768',
   'version': 'v3',
@@ -161,11 +193,24 @@ nfs_opts = {
   'proto': 'tcp',
 }
 
+def all_tests():
+  """This is the highest-level function and should run all tests in order,
+  assuming there are no problems executing anything."""
+  logging.info("Executing all tests")
+
+  network_test_all_sequential()
+  nfs_single(0,1,1024)
+  nfs_multi(0,1,1024,1024)
+
 def vary_nfs_opts(f, *args):
   #for rsize in [2**x for x in range(5,20)]
   for proto in ('tcp', 'udp'):
     for version in ('v3', 'v4'):
-      for wsize in (2**(2*x+1) for x in range(4,10)):
+      if proto == 'tcp':
+        wsizes = [2**(2*x+1) for x in range(4,10)]
+      else:
+        wsizes = [512, 2048] # 8192 is an error
+      for wsize in wsizes:
         fmt_s = 'rw,proto={0},soft,sync{1},rsize=32768,wsize={2}'
         vers = ',vers=3' if version == 'v3' else ''
         nfs_opts['opt_str'] = fmt_s.format(proto, vers, wsize)
@@ -176,8 +221,41 @@ def vary_nfs_opts(f, *args):
         nfs_opts['proto'] = proto
         f(*args)
 
-def vary_nfs_single():
-  pass
+def vary_nfs_multi(client_id, server_id):
+  client, server = id_to_inst(client_id, server_id)
+
+  try:
+    unmount_nfs_share(client, server)
+    unmount_nfs_share(client, server)
+    unmount_nfs_share(client, server)
+  except ProcException:
+    pass
+
+  restart_nfs_service(server)
+
+  for n_bytes in [1024, 65536, 524288, 1048576]:
+    for count in [10, 50, 250]:
+      vary_nfs_opts(nfs_multi, client_id, server_id, count, n_bytes)
+
+def vary_nfs_single(client_id, server_id):
+  client, server = id_to_inst(client_id, server_id)
+
+  try:
+    unmount_nfs_share(client, server)
+    unmount_nfs_share(client, server)
+    unmount_nfs_share(client, server)
+  except ProcException:
+    pass
+
+  try:
+    mount_ramdisk(server)
+  except ProcException:
+    pass
+
+  restart_nfs_service(server)
+
+  for n_bytes in [1024, 65536, 524288, 1048576, 10485760, 78643200, 262144000]:
+    vary_nfs_opts(nfs_single, client_id, server_id, n_bytes)
 
 def mount_nfs_share(client, server):
   logging.info("mounting nfs share with options {0}".format(nfs_opts['opt_str']))
@@ -207,7 +285,11 @@ def unmount_nfs_share(client, server):
 def unmount_ramdisk(machine):
   logging.debug("unmounting disk on server to clear any cache")
   umount_cmd = 'sudo umount -l /tmp/ramdisk'
-  ssh_cmd(machine, umount_cmd.split(" "), block=True)
+  try:
+    ssh_cmd(machine, umount_cmd.split(" "), block=True)
+  except ProcException:
+    # Only reason this should fail is if it's already unmounted
+    logging.warning("umount failed")
 
 def mount_ramdisk(machine):
   logging.debug("remounting fresh ramdisk on server")
@@ -220,6 +302,16 @@ def restart_nfs_service(machine):
   logging.debug("restarting nfs kernel service")
   mount_cmd = "sudo service nfs-kernel-server restart"
   ssh_cmd(machine, mount_cmd.split(" "), block=True)
+
+def nfs_multi_client_single_file(client_ids, server_id, n_bytes):
+  # TODO: make this threadded, write to different CSV file
+  for client in client_ids:
+    nfs_single(client_id, server_id, n_bytes)
+
+def nfs_multi_client_multi_file(client_ids, server_id, count, n_bytes):
+  # TODO: make this threadded, write to different CSV file
+  for client in client_ids:
+    nfs_multi(client_id, server_id, count, n_bytes)
 
 def nfs_single(client_id, server_id, n_bytes):
   client, server = id_to_inst(client_id, server_id)
@@ -235,14 +327,18 @@ def nfs_single(client_id, server_id, n_bytes):
     dd_cmd = ("dd if=/dev/urandom of=/mnt/remote_ramdisk_1/{0} "
               "bs={1} count=1".format(random_fn(), n_bytes))
     _, stderr = ssh_cmd(client, dd_cmd.split(" "), block=True)
+  except ProcException:
+    logging.warning("dd failure")
+    duration, speed = '-', '-'
+  else:
+    _, duration, speed = stderr.split("\n")[2].strip().split(", ")
+    speed = speed.replace(' ', '')
+    duration = duration.split(" ")[0]
   finally:
     unmount_nfs_share(client, server)
     unmount_ramdisk(server)
     mount_ramdisk(server)
 
-  _, duration, speed = stderr.split("\n")[2].strip().split(", ")
-  speed = speed.replace(' ', '')
-  duration = duration.split(" ")[0]
   date, time = get_date_time()
 
   with open('nfs_single.csv', 'ab') as f:
@@ -259,7 +355,7 @@ def nfs_multi(client_id, server_id, count, n_bytes):
              "{3} (client)")
   logging.info(log_str.format(count, sizeof_fmt(n_bytes), server_id, client_id))
 
-  restart_nfs_service(server)
+  #restart_nfs_service(server)
   mount_nfs_share(client, server)
 
   try:
@@ -268,8 +364,7 @@ def nfs_multi(client_id, server_id, count, n_bytes):
               'of=/mnt/remote_ramdisk_1/file_$i bs=%d count=1; done"' %
               (count, n_bytes))
     args = ['/usr/bin/time', '-f', "%e", 'bash', '-c', script]
-    p = ssh_cmd(client, args, block=False)
-    stdout, stderr = p.communicate()
+    _, stderr = ssh_cmd(client, args, block=True)
   finally:
     unmount_nfs_share(client, server)
     unmount_ramdisk(server)
@@ -285,24 +380,6 @@ def nfs_multi(client_id, server_id, count, n_bytes):
        count, duration, nfs_opts['version'], nfs_opts['rsize'],
        nfs_opts['wsize'], nfs_opts['proto']]
     )
-
-def all_tests():
-  logging.info("Executing all tests")
-  iperf_all()
-  nfs_single(0,1,1024)
-  nfs_multi(0,1,1024,1024)
-
-def get_date_time():
-  return str(datetime.datetime.now()).split(" ")
-
-def get_csv_writer(f):
-  return csv.writer(f, delimiter=' ', quotechar='|', quoting=csv.QUOTE_MINIMAL)
-
-def id_to_inst(*args):
-  """Turns id numbers into instances"""
-  if type(args[0]) == type(0):
-    return (instances[x] for x in args)
-  return args
 
 def log_2_test(test_name, id1, id2):
   logging.info("{0} from {1} -> {2}".format(test_name, id1, id2))
@@ -380,12 +457,11 @@ def iperf_2(client_id, server_id):
        num_lost, datagrams_sent, num_out_of_order]
     )
 
-def iperf_all_sequential():
+def network_test_all_sequential():
+  """Runs network tests between all pairs of instances"""
   for i1 in instances:
     for i2 in instances:
       if i1 != i2:
         iperf_2(i1, i2)
-
-def term_all():
-  for i in instances:
-    i.terminate()
+        ping(i1, i2)
+        tracert(i1, i2)
